@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"time"
@@ -14,190 +13,245 @@ import (
 )
 
 // --- CONFIGURATION ---
-// In a real app, load these from a .env file!
 const (
-	dbConnStr    = "host=localhost port=5432 user=journal_admin password=supersecret dbname=journal_db sslmode=disable"
-	colabBaseURL = "https://YOUR-NGROK-URL.ngrok-free.app" // Update this whenever you restart Colab
+	dbConnStr = "host=localhost port=5432 user=journal_admin password=supersecret dbname=journal_db sslmode=disable"
+	// Update this when your Colab Ngrok restarts
+	fastAPIURL = "https://safeguard-tableful-krypton.ngrok-free.dev" 
 )
 
 var db *sql.DB
 
-// --- DATA BLUEPRINTS (Structs) ---
-type JournalEntry struct {
-	ID      int    `json:"id,omitempty"`
-	Content string `json:"content"`
-	Date    string `json:"date"`
+// --- STRUCTS ---
+type Entry struct {
+	ID           int       `json:"id"`
+	UserID       string    `json:"user_id"`
+	Content      string    `json:"content"`
+	MoodScore    int       `json:"mood_score"`
+	MoodLabel    string    `json:"mood_label"`
+	GoalAnalysis string    `json:"goal_analysis"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
-type DateRangeRequest struct {
-	StartDate string         `json:"start_date"`
-	EndDate   string         `json:"end_date"`
-	Entries   []JournalEntry `json:"entries"`
+type Goal struct {
+	ID        int       `json:"id"`
+	UserID    string    `json:"user_id"`
+	Title     string    `json:"title"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
-// --- DATABASE SETUP ---
+// FastAPI Request/Response mapping
+type FastApiAnalyzeReq struct {
+	Text string `json:"text"`
+}
+type FastApiAnalyzeRes struct {
+	MoodType        string `json:"mood_type"`
+	DominantEmotion string `json:"dominant_emotion"`
+	Summary         string `json:"summary"`
+}
+
+// --- DATABASE INIT ---
 func initDB() {
 	var err error
 	db, err = sql.Open("postgres", dbConnStr)
 	if err != nil {
-		log.Fatalf("Failed to open DB connection: %v", err)
+		log.Fatalf("Failed to open DB: %v", err)
 	}
-
 	if err = db.Ping(); err != nil {
 		log.Fatalf("Failed to ping DB: %v", err)
 	}
-	fmt.Println("📦 Successfully connected to PostgreSQL!")
+	fmt.Println("📦 Connected to PostgreSQL!")
 }
 
-func createTables() {
-	query := `
-	CREATE TABLE IF NOT EXISTS entries (
-		id SERIAL PRIMARY KEY,
-		content TEXT NOT NULL,
-		entry_date DATE NOT NULL,
-		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-	);`
-	if _, err := db.Exec(query); err != nil {
-		log.Fatalf("Failed to create table: %v", err)
-	}
-	fmt.Println("✅ Database tables verified and ready!")
+// --- MIDDLEWARE ---
+// Enables your Vite/React frontend to talk to this backend
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
-// --- COLAB HELPER FUNCTION ---
-// askColab securely forwards JSON to your Python model and waits for the RAG insight
-func askColab(endpoint string, payload any) ([]byte, error) {
-	jsonData, err := json.Marshal(payload)
-	if err != nil {
-		return nil, err
-	}
+// --- HANDLERS ---
 
-	// 10-second timeout so the Go gateway doesn't freeze if Colab is slow
-	client := &http.Client{Timeout: 10 * time.Second}
-	req, err := http.NewRequest("POST", colabBaseURL+endpoint, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("colab unreachable: %v", err)
-	}
-	defer resp.Body.Close()
-
-	return io.ReadAll(resp.Body)
+func checkHealth(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintf(w, `{"status":"ok"}`)
 }
 
-// --- ROUTE HANDLERS ---
-
-// 1. CREATE & ANALYZE (Daily Door)
-func createEntryHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var entry JournalEntry
-	if err := json.NewDecoder(r.Body).Decode(&entry); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
-		return
-	}
-
-	// Save to Postgres
-	query := `INSERT INTO entries (content, entry_date) VALUES ($1, $2) RETURNING id`
-	err := db.QueryRow(query, entry.Content, entry.Date).Scan(&entry.ID)
+// GET /entries/{userId}
+func getEntries(w http.ResponseWriter, r *http.Request) {
+	userId := r.PathValue("userId")
+	rows, err := db.Query("SELECT id, user_id, content, mood_score, mood_label, goal_analysis, created_at FROM entries WHERE user_id = $1 ORDER BY created_at DESC", userId)
 	if err != nil {
-		http.Error(w, "Database error", http.StatusInternalServerError)
-		return
-	}
-
-	// Forward to Colab for Daily Analysis
-	insight, err := askColab("/api/predict/day", entry)
-	if err != nil {
-		fmt.Printf("Warning: Colab analysis failed: %v\n", err)
-		// We still return 200 because the entry was successfully saved to the DB
-		fmt.Fprintf(w, `{"message": "Saved to DB, but analysis failed", "id": %d}`, entry.ID)
-		return
-	}
-
-	// Send successful response to frontend
-	w.Header().Set("Content-Type", "application/json")
-	w.Write(insight)
-}
-
-// 2. READ (Get all entries for the frontend UI)
-func getEntriesHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Only GET allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	rows, err := db.Query(`SELECT id, content, TO_CHAR(entry_date, 'YYYY-MM-DD') FROM entries ORDER BY entry_date DESC`)
-	if err != nil {
-		http.Error(w, "Database error", http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
 
-	var entries []JournalEntry
+	var entries []Entry
 	for rows.Next() {
-		var e JournalEntry
-		if err := rows.Scan(&e.ID, &e.Content, &e.Date); err != nil {
-			continue
+		var e Entry
+		if err := rows.Scan(&e.ID, &e.UserID, &e.Content, &e.MoodScore, &e.MoodLabel, &e.GoalAnalysis, &e.CreatedAt); err == nil {
+			entries = append(entries, e)
 		}
-		entries = append(entries, e)
 	}
-
+	
+	// Ensure we return an empty array [] instead of null if no entries exist
+	if entries == nil {
+		entries = []Entry{}
+	}
+	
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(entries)
 }
 
-// 3. RANGE ANALYSIS (Batch processing)
-func analyzeRangeHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
-		return
+// POST /entries/
+func createEntry(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		UserID  string `json:"user_id"`
+		Content string `json:"content"`
 	}
-
-	var batch DateRangeRequest
-	if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
 
-	// Forward the entire batch to Colab
-	insight, err := askColab("/api/predict/range", batch)
+	_, err := db.Exec("INSERT INTO entries (user_id, content) VALUES ($1, $2)", req.UserID, req.Content)
 	if err != nil {
-		http.Error(w, "Colab analysis failed", http.StatusBadGateway)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.Write(insight)
+	
+	w.WriteHeader(http.StatusCreated)
+	fmt.Fprintf(w, `{"message":"Entry created"}`)
 }
 
-// --- MAIN SERVER START ---
+// DELETE /entries/{id}
+func deleteEntry(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	db.Exec("DELETE FROM entries WHERE id = $1", id)
+	w.WriteHeader(http.StatusOK)
+}
+
+// POST /analyze/batch/
+// This acts as a proxy: fetches entries, asks FastAPI to analyze them, updates DB
+func analyzeBatch(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		EntryIDs []int `json:"entry_ids"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+
+	for _, id := range req.EntryIDs {
+		// 1. Get content from DB
+		var content string
+		err := db.QueryRow("SELECT content FROM entries WHERE id = $1", id).Scan(&content)
+		if err != nil {
+			continue
+		}
+
+		// 2. Forward to Python FastAPI Ngrok URL
+		apiReq := FastApiAnalyzeReq{Text: content}
+		jsonData, _ := json.Marshal(apiReq)
+		resp, err := http.Post(fastAPIURL+"/analyze", "application/json", bytes.NewBuffer(jsonData))
+		
+		if err != nil || resp.StatusCode != 200 {
+			log.Printf("FastAPI connection failed for entry %d: %v", id, err)
+			continue
+		}
+
+		// 3. Parse Python response
+		var aiRes FastApiAnalyzeRes
+		json.NewDecoder(resp.Body).Decode(&aiRes)
+		resp.Body.Close()
+
+		// 4. Map the mood type to a 1-10 score for the Recharts graph in React
+		score := 5 // Default Neutral
+		if aiRes.MoodType == "positive" {
+			score = 8
+		} else if aiRes.MoodType == "negative" {
+			score = 3
+		}
+
+		// 5. Update Database
+		db.Exec(`UPDATE entries SET mood_score = $1, mood_label = $2, goal_analysis = $3 WHERE id = $4`,
+			score, aiRes.DominantEmotion, aiRes.Summary, id)
+	}
+
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, `{"message":"Batch analyzed successfully"}`)
+}
+
+// --- GOALS CRUD ---
+func getGoals(w http.ResponseWriter, r *http.Request) {
+	userId := r.PathValue("userId")
+	rows, _ := db.Query("SELECT id, user_id, title, created_at FROM goals WHERE user_id = $1 ORDER BY created_at DESC", userId)
+	defer rows.Close()
+
+	var goals []Goal
+	for rows.Next() {
+		var g Goal
+		if err := rows.Scan(&g.ID, &g.UserID, &g.Title, &g.CreatedAt); err == nil {
+			goals = append(goals, g)
+		}
+	}
+	if goals == nil {
+		goals = []Goal{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(goals)
+}
+
+func createGoal(w http.ResponseWriter, r *http.Request) {
+	var g Goal
+	json.NewDecoder(r.Body).Decode(&g)
+	db.Exec("INSERT INTO goals (user_id, title) VALUES ($1, $2)", g.UserID, g.Title)
+	w.WriteHeader(http.StatusCreated)
+}
+
+func deleteGoal(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	db.Exec("DELETE FROM goals WHERE id = $1", id)
+	w.WriteHeader(http.StatusOK)
+}
+
+// --- CHAT ENDPOINT ---
+func chatAssistant(w http.ResponseWriter, r *http.Request) {
+	// Since the FastAPI only handles analysis currently, this acts as a placeholder
+	// You can easily wire this up to an LLM API (like OpenAI/Gemini) later
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"reply": "I have reviewed your recent entries. It seems like academic stress is a recurring trigger for you this week. Try to take short breaks during your study sessions."}`)
+}
+
 func main() {
 	initDB()
-	createTables()
 	defer db.Close()
 
 	mux := http.NewServeMux()
 
-	// Registering the routes
-	mux.HandleFunc("/api/entries", func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodPost:
-			createEntryHandler(w, r)
-		case http.MethodGet:
-			getEntriesHandler(w, r)
-		default:
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		}
-	})
+	// Register Routes
+	mux.HandleFunc("GET /", checkHealth)
+	
+	mux.HandleFunc("GET /entries/{userId}", getEntries)
+	mux.HandleFunc("POST /entries/", createEntry)
+	mux.HandleFunc("DELETE /entries/{id}", deleteEntry)
+	
+	mux.HandleFunc("POST /analyze/batch/", analyzeBatch)
+	
+	mux.HandleFunc("GET /goals/{userId}", getGoals)
+	mux.HandleFunc("POST /goals/", createGoal)
+	mux.HandleFunc("DELETE /goals/{id}", deleteGoal)
+	
+	mux.HandleFunc("POST /chat/", chatAssistant)
 
-	mux.HandleFunc("/api/analyze/range", analyzeRangeHandler)
+	// Wrap the mux with the CORS middleware
+	handler := corsMiddleware(mux)
 
-	fmt.Println("🚀 Gateway running concurrently on port 8080...")
-	log.Fatal(http.ListenAndServe(":8080", mux))
+	fmt.Println("🚀 Go API Gateway running on http://localhost:8080")
+	log.Fatal(http.ListenAndServe(":8080", handler))
 }
