@@ -15,7 +15,6 @@ import (
 // --- CONFIGURATION ---
 const (
 	dbConnStr = "host=localhost port=5432 user=journal_admin password=supersecret dbname=journal_db sslmode=disable"
-	// Update this when your Colab Ngrok restarts
 	fastAPIURL = "https://safeguard-tableful-krypton.ngrok-free.dev" 
 )
 
